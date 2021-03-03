@@ -33,6 +33,7 @@ import kotlin.random.nextUBytes
 
 private val logger = KotlinLogging.logger {}
 private const val CHUNK_SIZE = 800
+private const val BLUETOOTH_CHUNK_SIZE = 200
 
 class AttestationCommunity(val database: AttestationStore) : Community() {
     override val serviceId = "e5d116f803a916a84850b9057cc0f662163f71f5"
@@ -246,7 +247,7 @@ class AttestationCommunity(val database: AttestationStore) : Community() {
             )
         }
 
-        this.sendAttestation(peer.address,
+        this.sendAttestation(peer,
             attestationBlob,
             dist.globalTime,
             metadata.toString().toByteArray(),
@@ -337,33 +338,39 @@ class AttestationCommunity(val database: AttestationStore) : Community() {
         val privateAttestation = schemaManager.deserializePrivate(privateKey, attestationBlob, idFormat)
         val publicAttestationBlob = privateAttestation.serialize()
         this.cachedAttestationBlobs[ByteArrayKey(payload.hash)] = privateAttestation
-        this.sendAttestation(peer.address, publicAttestationBlob)
+        this.sendAttestation(peer, publicAttestationBlob)
     }
 
     private fun sendAttestation(
-        sockedAddress: IPv4Address,
+        peer: Peer,
         blob: ByteArray,
         globalTime: ULong? = null,
         metaData: ByteArray? = null,
         signature: ByteArray? = null,
     ) {
         var sequenceNumber = 0
-        for (i in blob.indices step CHUNK_SIZE) {
-            val endIndex = if (i + CHUNK_SIZE > blob.size) blob.size else i + CHUNK_SIZE
+        val blobHash = sha1(blob)
 
-            val blobChunk = blob.copyOfRange(i, endIndex)
-            logger.info("Sending attestation chunk $sequenceNumber to $sockedAddress")
+        // All but final byte
+        val bytes = blob.copyOfRange(0, blob.lastIndex)
+        val chunkSize = if (peer.address.isEmpty() && peer.bluetoothAddress != null) BLUETOOTH_CHUNK_SIZE else CHUNK_SIZE
+        for (i in bytes.indices step chunkSize) {
+            val endIndex = if (i + chunkSize > bytes.size) bytes.size else i + chunkSize
+
+            val blobChunk = bytes.copyOfRange(i, endIndex)
+            logger.info("Sending attestation chunk $sequenceNumber to ${peer.mid}")
 
             // Only send metadata and signature on final package to reduce overhead.
-            val payload =
-                if (i + CHUNK_SIZE > blob.size)
-                    AttestationChunkPayload(sha1(blob), sequenceNumber, blobChunk, metaData, signature)
-                else
-                    AttestationChunkPayload(sha1(blob), sequenceNumber, blobChunk)
+            val payload = AttestationChunkPayload(blobHash, sequenceNumber, blobChunk)
             val packet = serializePacket(ATTESTATION, payload, prefix = this.prefix, timestamp = globalTime)
-            this.endpoint.send(sockedAddress, packet)
+            this.endpoint.send(peer, packet)
             sequenceNumber += 1
         }
+
+        // Send final byte along with signature.
+        val signaturePayload = AttestationChunkPayload(blobHash, sequenceNumber, byteArrayOf(blob.last()), metaData, signature)
+        val signaturePacket = serializePacket(ATTESTATION, signaturePayload, prefix = this.prefix, timestamp = globalTime)
+        this.endpoint.send(peer, signaturePacket)
     }
 
     private fun onAttestationChunk(peer: Peer, dist: GlobalTimeDistributionPayload, payload: AttestationChunkPayload) {
